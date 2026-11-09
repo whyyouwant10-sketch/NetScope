@@ -1,6 +1,7 @@
 package com.example.netscopepoc
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.AppOpsManager
 import android.content.Intent
@@ -13,22 +14,41 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import java.time.LocalDate
 
 class MainActivity : ComponentActivity() {
     private val MB = 1024L * 1024L
 
-    override fun onCreate(s: Bundle?) { super.onCreate(s); setContent { MaterialTheme { Screen() } } }
+    private enum class Page { Front, AllStats, History }
+
+    override fun onCreate(s: Bundle?) {
+        super.onCreate(s)
+        HistoryStore.ensureLoaded(this)
+        if (s == null) {
+            runCatching { startForegroundService(Intent(this, LoggerService::class.java)) }
+        }
+        setContent { MaterialTheme { Screen() } }
+    }
 
     private fun granted(p: String) = checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
     private fun usageOk() = getSystemService(AppOpsManager::class.java).unsafeCheckOpNoThrow(
@@ -39,6 +59,52 @@ class MainActivity : ComponentActivity() {
         bps >= 1_000_000L -> "%.2f Mbps".format(bps / 1_000_000.0)
         bps >= 1_000L -> "%.1f KB/s".format(bps / 1_000.0)
         else -> "$bps B/s"
+    }
+
+    private val prefs by lazy { getSharedPreferences("netscope", MODE_PRIVATE) }
+    private fun cap4gBytes() = prefs.getLong("cap4g_bytes", 0L)
+    @SuppressLint("ApplySharedPref")
+    private fun setCap4gBytes(b: Long) { prefs.edit().putLong("cap4g_bytes", b).commit() }
+    private fun alertStepBytes() = prefs.getLong("alert_step_bytes", 500L * MB)
+    @SuppressLint("ApplySharedPref")
+    private fun setAlertStepBytes(b: Long) { prefs.edit().putLong("alert_step_bytes", b).commit() }
+
+    @SuppressLint("ApplySharedPref")
+    private fun resetCapUsage() {
+        Live.capUsed4gBytes = 0L
+        prefs.edit().putLong("cap_used_4g_bytes", 0L).commit()
+    }
+
+    private fun compactBytes(b: Long): String {
+        val mb = b / 1048576.0
+        return if (mb >= 1024.0) "%.1fGB".format(mb / 1024.0) else "%.0fMB".format(mb)
+    }
+
+    /** Two-decimal formatting for the 4G remaining figure. */
+    private fun preciseBytes(b: Long): String {
+        val mb = b / 1048576.0
+        return if (mb >= 1024.0) "%.2fGB".format(mb / 1024.0) else "%.2fMB".format(mb)
+    }
+
+    private fun remainingText(used: Long, cap: Long): String {
+        if (cap <= 0L) return ""
+        val remaining = cap - used
+        return if (remaining >= 0L) "${preciseBytes(remaining)} left"
+        else "over ${preciseBytes(-remaining)}"
+    }
+
+    private fun capInputText(b: Long): String {
+        if (b <= 0L) return ""
+        val gb = b / 1073741824.0
+        return if (gb == gb.toLong().toDouble()) gb.toLong().toString()
+        else "%.2f".format(gb).trimEnd('0').trimEnd('.')
+    }
+
+    private fun stepInputText(b: Long): String {
+        if (b <= 0L) return "0"
+        val mb = b / 1048576.0
+        return if (mb == mb.toLong().toDouble()) mb.toLong().toString()
+        else "%.1f".format(mb).trimEnd('0').trimEnd('.')
     }
 
     private fun pssMb(): Double? = try {
@@ -83,6 +149,14 @@ class MainActivity : ComponentActivity() {
         else -> "no network"
     }
 
+    private fun currentNetworkLabel() = when {
+        Live.transport == "wifi" -> "Wi-Fi"
+        Live.transport == "cell" && Live.cls != "unknown" -> Live.cls.uppercase()
+        Live.transport == "cell" -> "Mobile"
+        Live.transport == "other" -> "Other"
+        else -> "No network"
+    }
+
     private fun observedMobile(): Long =
         (Live.totals["4g"] ?: 0L) + (Live.totals["5g"] ?: 0L) +
             (Live.totals["other"] ?: 0L) + (Live.totals["unknown"] ?: 0L)
@@ -98,13 +172,11 @@ class MainActivity : ComponentActivity() {
         val i = Intent(this, LoggerService::class.java)
         when {
             !Live.running -> startForegroundService(i)
+            // Cancel a pending stop; the service keeps running.
+            Live.stopAfterSample -> Live.stopAfterSample = false
             // A pending marker must be written before the service dies.
-            Live.stopAfterSample -> {
-                Live.stopAfterSample = false
-                stopService(i)
-            }
             Live.note.isNotEmpty() -> Live.stopAfterSample = true
-            else -> stopService(i)
+            else -> startService(i.setAction(LoggerService.ACTION_STOP))
         }
     }
 
@@ -112,11 +184,11 @@ class MainActivity : ComponentActivity() {
     fun Screen() {
         var tick by remember { mutableIntStateOf(0) }
         var marker by remember { mutableStateOf("") }
-        var showAllStats by remember { mutableStateOf(false) }
+        var page by remember { mutableStateOf(Page.Front) }
         val drawerState = rememberDrawerState(DrawerValue.Closed)
         val scope = rememberCoroutineScope()
 
-        LaunchedEffect(Unit) { while (true) { delay(2000); tick++ } }
+        LaunchedEffect(Unit) { while (true) { delay(1000); tick++ } }
 
         val perms = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { tick++ }
         val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
@@ -134,24 +206,46 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.padding(horizontal = 16.dp))
                     HorizontalDivider(Modifier.padding(vertical = 12.dp))
                     NavigationDrawerItem(
-                        label = { Text("All stats") },
-                        selected = showAllStats,
+                        label = { Text("Overview") },
+                        selected = page == Page.Front,
                         onClick = {
-                            showAllStats = true
+                            page = Page.Front
                             scope.launch { drawerState.close() }
                         },
                         modifier = Modifier.padding(horizontal = 12.dp),
                     )
-                    Text("Expanded stats view (placeholder for the final design).",
+                    NavigationDrawerItem(
+                        label = { Text("History") },
+                        selected = page == Page.History,
+                        onClick = {
+                            page = Page.History
+                            scope.launch { drawerState.close() }
+                        },
+                        modifier = Modifier.padding(horizontal = 12.dp),
+                    )
+                    NavigationDrawerItem(
+                        label = { Text("All stats") },
+                        selected = page == Page.AllStats,
+                        onClick = {
+                            page = Page.AllStats
+                            scope.launch { drawerState.close() }
+                        },
+                        modifier = Modifier.padding(horizontal = 12.dp),
+                    )
+                    Text("Daily history is kept separately from the 24-hour CSV log.",
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(16.dp))
                 }
             },
         ) {
-            if (showAllStats) {
-                AllStatsScreen(tick = tick, onBack = { showAllStats = false })
-            } else {
-                FrontScreen(
+            when (page) {
+                Page.AllStats -> AllStatsScreen(
+                    tick = tick,
+                    onBack = { page = Page.Front },
+                    onToggleLogging = { toggleLogging() },
+                )
+                Page.History -> HistoryScreen(tick = tick, onBack = { page = Page.Front })
+                Page.Front -> FrontScreen(
                     tick = tick,
                     marker = marker,
                     onMarkerChange = { marker = it },
@@ -164,7 +258,6 @@ class MainActivity : ComponentActivity() {
                     onOpenUsageAccess = {
                         startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
                     },
-                    onToggleLogging = { toggleLogging() },
                     onExport = { export.launch("netscope_poc.csv") },
                     onMark = {
                         Live.markerCount += 1
@@ -184,7 +277,6 @@ class MainActivity : ComponentActivity() {
         onOpenMenu: () -> Unit,
         onRequestPermissions: () -> Unit,
         onOpenUsageAccess: () -> Unit,
-        onToggleLogging: () -> Unit,
         onExport: () -> Unit,
         onMark: () -> Unit,
     ) {
@@ -199,6 +291,9 @@ class MainActivity : ComponentActivity() {
         val appData = remember(tick) { dirSize(filesDir) + dirSize(cacheDir) }
         val csvBytes = remember(tick) { File(filesDir, "netscope_poc.csv").length() }
         val apkBytes = remember(tick) { apkBytes() }
+        var capInput by remember { mutableStateOf(capInputText(cap4gBytes())) }
+        var stepInput by remember { mutableStateOf(stepInputText(alertStepBytes())) }
+        val cap = cap4gBytes()
 
         Column(
             Modifier.statusBarsPadding().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -206,8 +301,10 @@ class MainActivity : ComponentActivity() {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onOpenMenu) { Text("Menu") }
-                Spacer(Modifier.width(4.dp))
-                Text("NetScope POC-01", style = MaterialTheme.typography.headlineSmall)
+                Text("NetScope", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.weight(1f))
+                Text(currentNetworkLabel(), style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary)
             }
 
             // Permissions are only shown while something is missing. Once granted
@@ -229,15 +326,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            Button(onClick = onToggleLogging) {
-                Text(
-                    when {
-                        Live.stopAfterSample -> "Stopping after next sample"
-                        Live.running -> "Stop logging"
-                        else -> "Start logging"
-                    },
-                )
-            }
+            Text(
+                when {
+                    Live.stopAfterSample -> "Logging: stopping after the next sample"
+                    Live.running -> "Logging: active"
+                    else -> "Logging: stopped (start it from Menu > All stats)"
+                },
+                style = MaterialTheme.typography.titleMedium,
+            )
             if (Live.stopAfterSample) {
                 Text("Marker pending: one more sample will be written before logging stops.",
                     style = MaterialTheme.typography.bodySmall)
@@ -261,7 +357,45 @@ class MainActivity : ComponentActivity() {
                 Text("Wi-Fi total: ${mbOrNa(Live.nsWifiSession)}")
                 BucketLine("4G", Live.totals["4g"] ?: 0L, Live.ambiguous["4g"] ?: 0L)
                 BucketLine("5G", Live.totals["5g"] ?: 0L, Live.ambiguous["5g"] ?: 0L)
+                if (cap > 0L) {
+                    Text("4G allowance used: ${mb(Live.capUsed4gBytes)} · " +
+                        remainingText(Live.capUsed4gBytes, cap))
+                }
             }
+
+            Text("4G tracking", style = MaterialTheme.typography.titleMedium)
+            OutlinedTextField(
+                value = capInput,
+                onValueChange = { v ->
+                    capInput = v
+                    val gb = v.toDoubleOrNull()
+                    setCap4gBytes(if (gb == null || gb <= 0.0) 0L else (gb * 1073741824.0).toLong())
+                },
+                label = { Text("4G allowance (GB)") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = stepInput,
+                onValueChange = { v ->
+                    stepInput = v
+                    val stepMb = v.toDoubleOrNull()
+                    setAlertStepBytes(if (stepMb == null || stepMb <= 0.0) 0L else (stepMb * MB).toLong())
+                },
+                label = { Text("4G usage alert every (MB)") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (cap > 0L) {
+                Text("Remaining = allowance - 4G used since the last reset. " +
+                    "Usage is remembered across restarts.",
+                    style = MaterialTheme.typography.bodySmall)
+            }
+            TextButton(onClick = { resetCapUsage() }) { Text("Reset usage") }
+            Text("Set the alert step to 0 to disable usage alerts.",
+                style = MaterialTheme.typography.bodySmall)
 
             if (observed > 0) {
                 val coverage = coveragePercent(observed)
@@ -330,7 +464,122 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun AllStatsScreen(tick: Int, onBack: () -> Unit) {
+    private fun HistoryScreen(tick: Int, onBack: () -> Unit) {
+        val revision = HistoryLive.revision
+        val days = remember(tick, revision) { HistoryLive.days.values.toList() }
+        val today = LocalDate.now()
+        val summaries = listOf(
+            "Last 7 days" to HistoryMath.lastDays(days, today, 7),
+            "Last 30 days" to HistoryMath.lastDays(days, today, 30),
+            "This month" to HistoryMath.thisMonth(days, today),
+            "All time" to HistoryMath.allTime(days),
+        )
+        val rows = HistoryFormat.dailyRows(days, today, 30)
+        val widths = listOf(104.dp, 72.dp, 72.dp, 82.dp, 82.dp, 82.dp)
+        val tableScroll = rememberScrollState()
+
+        Column(
+            Modifier.statusBarsPadding().verticalScroll(rememberScrollState()).padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onBack) { Text("Back") }
+                Spacer(Modifier.width(4.dp))
+                Text("History", style = MaterialTheme.typography.headlineSmall)
+            }
+            Text("Mobile = 4G + 5G + other/unknown. Wi-Fi comes from NetworkStats. " +
+                "Daily history is kept indefinitely; the CSV holds 24 hours.",
+                style = MaterialTheme.typography.bodySmall)
+
+            Column(
+                Modifier
+                    .horizontalScroll(tableScroll)
+                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                HistoryTableRow(
+                    cells = listOf("Date", "4G", "5G", "Mobile", "Wi-Fi", "Total"),
+                    widths = widths,
+                    header = true,
+                    numericFrom = 1,
+                )
+                rows.forEach { day ->
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    HistoryTableRow(
+                        cells = listOf(
+                            HistoryFormat.date(day.date),
+                            HistoryFormat.bytes(day.mobile4g),
+                            HistoryFormat.bytes(day.mobile5g),
+                            HistoryFormat.bytes(day.mobile),
+                            HistoryFormat.bytes(day.wifi),
+                            HistoryFormat.bytes(day.total),
+                        ),
+                        widths = widths,
+                        header = false,
+                        numericFrom = 1,
+                    )
+                }
+                summaries.forEach { (label, totals) ->
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    HistoryTableRow(
+                        cells = listOf(
+                            label,
+                            HistoryFormat.bytes(totals.mobile4g),
+                            HistoryFormat.bytes(totals.mobile5g),
+                            HistoryFormat.bytes(totals.mobile),
+                            HistoryFormat.bytes(totals.wifi),
+                            HistoryFormat.bytes(totals.total),
+                        ),
+                        widths = widths,
+                        header = false,
+                        numericFrom = 1,
+                        emphasized = true,
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun HistoryTableRow(
+        cells: List<String>,
+        widths: List<Dp>,
+        header: Boolean,
+        numericFrom: Int,
+        emphasized: Boolean = false,
+    ) {
+        Row(
+            Modifier
+                .background(
+                    when {
+                        header -> MaterialTheme.colorScheme.surfaceVariant
+                        emphasized -> MaterialTheme.colorScheme.surface
+                        else -> Color.Transparent
+                    },
+                )
+                .padding(vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            cells.forEachIndexed { index, value ->
+                Text(
+                    text = value,
+                    modifier = Modifier
+                        .width(widths[index])
+                        .padding(horizontal = 6.dp),
+                    style = when {
+                        header -> MaterialTheme.typography.titleSmall
+                        emphasized -> MaterialTheme.typography.titleSmall
+                        else -> MaterialTheme.typography.bodySmall
+                    },
+                    fontWeight = if (emphasized) FontWeight.SemiBold else null,
+                    textAlign = if (index >= numericFrom) TextAlign.End else TextAlign.Start,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+
+    @Composable
+    private fun AllStatsScreen(tick: Int, onBack: () -> Unit, onToggleLogging: () -> Unit) {
         val observed = observedMobile()
         val sessionMobile = Live.nsMobileSession
         val gate = qualityGate(sessionMobile)
@@ -344,6 +593,28 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.width(4.dp))
                 Text("All stats", style = MaterialTheme.typography.headlineSmall)
             }
+
+            HorizontalDivider()
+
+            Text("Logging control", style = MaterialTheme.typography.titleMedium)
+            Button(onClick = onToggleLogging) {
+                Text(
+                    when {
+                        Live.stopAfterSample -> "Cancel pending stop"
+                        Live.running -> "Stop logging"
+                        else -> "Start logging"
+                    },
+                )
+            }
+            if (Live.stopAfterSample) {
+                Text("Marker pending: one more sample will be written before logging stops.",
+                    style = MaterialTheme.typography.bodySmall)
+            }
+            Text("Stop ends the current session and clears its 4G/Wi-Fi totals. " +
+                "Daily history is kept.",
+                style = MaterialTheme.typography.bodySmall)
+
+            HorizontalDivider()
 
             key(tick) {
                 Text("Permissions", style = MaterialTheme.typography.titleMedium)
@@ -380,6 +651,12 @@ class MainActivity : ComponentActivity() {
                         ambiguous = Live.ambiguous[bucket] ?: 0L,
                     )
                 }
+                val cap = cap4gBytes()
+                if (cap > 0L) {
+                    Text("4G allowance used: ${mb(Live.capUsed4gBytes)}")
+                    Text("4G remaining: ${remainingText(Live.capUsed4gBytes, cap)}")
+                }
+                Text("4G alert step: ${compactBytes(alertStepBytes())}")
                 Text("Wi-Fi since logging started (not generation-classified): ${mbOrNa(Live.nsWifiSession)}")
 
                 if (observed > 0) {

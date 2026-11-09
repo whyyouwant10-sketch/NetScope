@@ -4,7 +4,8 @@ A deliberately small Android app that validates the riskiest part of NetScope:
 **can 4G/5G usage be classified honestly on a real device?**
 
 POC-01 is not the product UI. It has no Room database, charts, Hilt, per-app
-usage, alerts, or background scheduler. It only measures, classifies, and logs.
+usage, or background scheduler. It measures, classifies, logs, keeps daily
+history, and posts a few focused alerts.
 
 ## What it does
 
@@ -60,10 +61,10 @@ unreliable.
 
 ### Sampling and attribution
 
-- TrafficStats and telephony sample at **2 s** while mobile bytes are moving and
+- TrafficStats and telephony sample at **1 s** while mobile bytes are moving and
   **5 s** while idle. NetworkStats is queried at each sample but no more often
   than every **2 s**, so active sampling gets a fresh sanity bound every 2 s.
-  The same 2 s cadence drives the front-page download/upload speed while active.
+  The 1 s active cadence drives the front-page and notification speed.
 - Every display-info class change inside an interval is recorded. Multiple
   transitions are replayed in order and the interval is split proportionally to
   the time spent in each class. The total byte count stays exact; only the split
@@ -121,18 +122,44 @@ device.
 1. Grant permissions when the **Permissions needed** section appears. Once
    Phone state, Notifications, and Usage access are all granted, that section is
    hidden.
-2. Tap **Start logging**. A low-importance foreground notification keeps the
-   sampler alive.
+2. Logging starts automatically when the app opens. A low-importance foreground
+   notification keeps the sampler alive; use **Menu > All stats > Stop logging**
+   to end the session.
 3. The front screen shows the simplified view: current class, download/upload
    speed, mobile and Wi-Fi session totals, 4G/5G session bytes, coverage,
-   reconciliation, and warnings. Open **Menu > All stats** for raw counters, all
-   buckets, per-interface speeds, and the full reconciliation.
+   reconciliation, and warnings. Open
+   **Menu > History** for daily usage and **Menu > All stats** for raw counters,
+   all buckets, per-interface speeds, and the full reconciliation.
 4. Type a label (optional) and tap **Mark next row** to tag the next CSV row.
    The last marker and its time are shown near the tools at the bottom.
 5. Tap **Export CSV** to save the log through the Storage Access Framework.
 6. The bottom **App resources** block shows dynamic RAM (PSS), Java heap, app
    data, CSV size, and APK size. PSS is Android's process-memory estimate and
    changes between samples.
+
+### Ongoing notification
+
+While logging, the foreground notification shows the current network
+(4G/5G/Wi-Fi), download/upload speed, and 4G/5G/Wi-Fi session totals in its
+collapsed form. Expanding it adds cellular and Wi-Fi signal quality
+(Excellent/Good/Fair/Weak/Poor). Tapping the notification opens the app.
+
+### 4G tracking
+
+Set a 4G allowance in GB on the front page. Only 4G usage is counted against it;
+5G, other mobile generations, and unknown traffic do not reduce the figure. 4G
+usage is counted across logging sessions, service restarts, and explicit stops,
+so the remaining figure is remembered. It is shown in the app and in the
+notification as `4G: 500MB (1.5GB)`. Editing the allowance changes the remaining
+figure without clearing usage; **Reset usage** clears it.
+
+A second field sets the 4G usage alert step in MB (default 500 MB). Each time
+usage since the last reset crosses the next step, the app posts a notification
+such as `1 GB 4G consumed`, including the remaining allowance when one is set.
+
+The app also posts a notification when the mobile generation changes directly
+between 4G and 5G (`5G → 4G` or `4G → 5G`). These alerts use a separate
+high-importance channel, so they can appear as heads-up notifications.
 
 ### Test protocol
 
@@ -149,10 +176,53 @@ device.
    negative.
 9. Revoke Phone state and confirm the app keeps running with `unknown` rather
    than fabricated data.
+10. Set a 4G allowance (for example 2 GB) and confirm the remaining figure
+    decreases on 4G traffic in both the app and the notification, including
+    after a restart. 5G traffic must not reduce it.
+11. Set the 4G alert step to a small value and confirm the usage notifications
+    report the cumulative total.
+12. Move between 4G and 5G and confirm the generation-change notification.
 
 If you tap **Stop logging** while a marker is pending, the app writes one more
 sample before stopping, so the marker is not lost. Otherwise wait at least one
 sampling interval after the last marker.
+
+### Testing notifications and mobile tracking
+
+1. Install the debug APK, grant Phone state, Notifications, and Usage access,
+   then start logging.
+2. Press Home. The ongoing notification must keep updating while the app is in
+   the background.
+3. Start a download. The speed line should update about once per second while
+   traffic is moving; after traffic stops it backs off to 5 s.
+4. Expand the notification. Signal quality should show labels such as
+   `Cell Good · Wi-Fi Excellent`, not raw dBm.
+5. Enter `2` in **4G allowance (GB)**. On 4G, the app and notification should
+   show `4G: 500MB (1.5GB)`; 5G traffic must not reduce the remaining figure.
+6. Set **4G usage alert every (MB)** to a small value such as `50`, consume 4G
+   data, and confirm cumulative alerts: `50 MB 4G consumed`, `100 MB ...`.
+7. Switch the preferred network between 5G and LTE while mobile data is active.
+   Expect `5G → 4G` or `4G → 5G` heads-up alerts.
+8. Tap any notification and confirm the app opens.
+9. Force-stop and restart the app, then confirm the used amount is remembered.
+   Tap **Reset usage** and confirm the remaining figure returns to the full
+   allowance while the allowance and alert step stay saved.
+
+### Testing history, persistence, and auto-start
+
+1. Use some 4G, 5G, and Wi-Fi data, then open **Menu > History**. Confirm daily
+   rows appear and the last 7 days / last 30 days / this month / all-time
+   summaries match the rows.
+2. Force-stop the app from Android settings, reopen it, and confirm logging
+   starts automatically and the session totals from before the stop are still
+   shown.
+3. While the service is running, open **Menu > All stats** and tap **Stop
+   logging**. Confirm logging stops and the next app open starts a fresh session
+   (session totals reset, daily history remains).
+4. Reboot the device and confirm logging starts again without opening the app
+   (subject to the OEM's background-start policy).
+5. Confirm the CSV file never contains rows older than 24 hours after an hourly
+   prune, while **History** still shows older daily totals.
 
 ### CSV columns
 
@@ -209,6 +279,31 @@ two rebase jumps of 40.9 GB and 41.3 GB, observed mobile was 875.54 MB against
 NetworkStats 875.66 MB — a 0.01% difference — with 95% classification coverage.
 
 
+## History, persistence, and auto-start
+
+Logging starts automatically when the app is opened and after a reboot
+(`BootReceiver`). It keeps running until the user explicitly stops it with the
+**Stop logging** button in **Menu > All stats**. The notification itself has no
+stop action, so it cannot be stopped by accident.
+
+- The current session is snapshotted to `session.json` every few seconds and on
+  service shutdown. After a system-initiated restart the service restores the
+  4G/5G totals, ambiguity, markers, and NetworkStats session totals.
+- An explicit user Stop clears `session.json`, so the next start is a fresh
+  session. Daily history and the 4G allowance usage are never cleared by a
+  stop; only **Reset usage** clears the 4G allowance usage.
+- At startup, the first NetworkStats query after a restore adds only a positive
+  mobile gap (traffic that happened while the service was down) to the
+  `unknown` mobile bucket. A missing or rolled-back value adds nothing, so a
+  midnight rollover cannot double-count.
+- Daily history is stored separately in `history.json` and is kept indefinitely.
+  **Menu > History** shows the last 30 calendar days (newest first, zero-filled)
+  as a table: Date, 4G, 5G, Mobile (4G + 5G + other/unknown), Wi-Fi, Total.
+  Summary rows at the bottom show the last 7 days, last 30 days, this month, and
+  all time.
+- The detailed CSV is pruned to the last 24 hours at startup and once per hour.
+  Export always writes the current 24-hour file.
+
 ## Known limitations
 
 - No public historical per-generation byte counters exist.
@@ -227,8 +322,8 @@ NetworkStats 875.66 MB — a 0.01% difference — with 95% classification covera
 - `NetworkStatsManager` historical data can lag live counters. A jump that
   NetworkStats has not yet corroborated is logged as `counter_rebase_unverified`.
 - Per-SIM totals are not guaranteed to be available to third-party apps.
-- Per-app usage, alerts, CSV aggregation, and the Room database are out of scope
-  for POC-01.
+- Per-app usage and the Room database are out of scope for POC-01. Daily
+  history is a compact JSON store, not a queryable analytics database.
 
 ## Next step
 

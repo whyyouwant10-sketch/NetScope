@@ -7,12 +7,15 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.TrafficStats
+import android.net.wifi.WifiManager
 import android.os.*
 import android.provider.Settings
 import android.telephony.*
+import android.widget.RemoteViews
 import androidx.compose.runtime.*
 import java.io.File
 import java.time.*
+import java.time.temporal.ChronoUnit
 
 /** Observable state shown on the diagnostics screen. */
 object Live {
@@ -39,6 +42,11 @@ object Live {
     var nsMobileSession by mutableLongStateOf(-1)
     var nsWifiSession by mutableLongStateOf(-1)
 
+    /** Latest cellular signal. Int.MIN_VALUE means no reading yet. */
+    var signalDbm by mutableIntStateOf(Int.MIN_VALUE)
+    /** 0..4 bars from the same CellSignalStrength reading. */
+    var signalLevel by mutableIntStateOf(0)
+
     var note by mutableStateOf("")
     /** Wall-clock time of the last completed sample; makes sampling gaps visible. */
     var lastSampleAt by mutableLongStateOf(0L)
@@ -55,6 +63,13 @@ object Live {
     var ambiguousTotal by mutableLongStateOf(0L)
     var rebaseTotal by mutableLongStateOf(0L)
     var resetEvents by mutableLongStateOf(0L)
+
+    /**
+     * 4G bytes counted against the user's 4G allowance. This is persisted
+     * separately from the session so the remaining figure survives restarts
+     * and explicit stops until the user resets it.
+     */
+    var capUsed4gBytes by mutableLongStateOf(0L)
 
     /**
      * 4G upper bound: assign residual ambiguity to 4G. Default on because an
@@ -75,7 +90,7 @@ object Live {
 }
 
 /**
- * POC-01: samples every 2-5 s, classifies, appends to CSV.
+ * POC-01: samples every 1-5 s, classifies, appends to CSV.
  *
  * Sampling is fast while mobile bytes are moving and slow while idle. Radio
  * transitions are time-split using the display-info callback timestamp, counter
@@ -120,20 +135,48 @@ class LoggerService : Service() {
     private var nsPrevWifi = -1L
     private var lastNsElapsed = 0L
 
-    private val cb = object : TelephonyCallback(), TelephonyCallback.DisplayInfoListener {
+    /** Highest 4G usage milestone already announced, in units of the current step. */
+    private var lastMilestone = 0L
+    private var lastAlertStep = 0L
+
+    /** True when the user asked to stop, so the persisted session must be cleared. */
+    private var explicitStop = false
+    /** First sample after a restore: its NetworkStats delta is downtime traffic. */
+    private var pendingRestartGap = false
+    private var lastPersistElapsed = 0L
+    private var lastPruneElapsed = 0L
+
+    private val cb = object : TelephonyCallback(), TelephonyCallback.DisplayInfoListener,
+        TelephonyCallback.SignalStrengthsListener {
         override fun onDisplayInfoChanged(ti: TelephonyDisplayInfo) {
             val nextClass = NetworkClassifier.networkClass(ti.networkType, ti.overrideNetworkType)
+            val previousClass = currentClass
             // A change of the classified bucket is a real transition. LTE-CA
             // override flapping (0 <-> 1) stays 4G and must not discard the interval.
             // Keep every change so multiple transitions inside one interval can
             // be replayed in order.
             if (haveDisplayInfo && nextClass != currentClass) {
                 transitions += ClassTransition(SystemClock.elapsedRealtime(), nextClass)
+                if (transport() == "cell" &&
+                    ((previousClass == NetworkClassifier.CLASS_4G &&
+                            nextClass == NetworkClassifier.CLASS_5G) ||
+                        (previousClass == NetworkClassifier.CLASS_5G &&
+                            nextClass == NetworkClassifier.CLASS_4G))
+                ) {
+                    notifyClassChange(previousClass, nextClass)
+                }
             }
             nt = ti.networkType
             ov = ti.overrideNetworkType
             currentClass = nextClass
             haveDisplayInfo = true
+        }
+
+        override fun onSignalStrengthsChanged(signalStrength: SignalStrength) {
+            val best = signalStrength.cellSignalStrengths.maxByOrNull { it.level } ?: return
+            Live.signalDbm = best.dbm
+            Live.signalLevel = best.level
+            updateNotification()
         }
     }
 
@@ -146,6 +189,185 @@ class LoggerService : Service() {
         }
     }
 
+    private fun currentNetworkLabel(): String = when {
+        Live.transport == "wifi" -> "Wi-Fi"
+        Live.transport == "cell" && Live.cls != "unknown" -> Live.cls.uppercase()
+        Live.transport == "cell" -> "Mobile"
+        Live.transport == "other" -> "Other"
+        else -> "No network"
+    }
+
+    private fun formatSpeed(bps: Long): String = when {
+        bps >= 1_000_000L -> "%.2f Mbps".format(bps / 1_000_000.0)
+        bps >= 1_000L -> "%.1f KB/s".format(bps / 1_000.0)
+        else -> "$bps B/s"
+    }
+
+    private fun compactBytes(b: Long): String {
+        val mb = b / 1048576.0
+        return if (mb >= 1024.0) "%.1fGB".format(mb / 1024.0) else "%.0fMB".format(mb)
+    }
+
+    /** Two-decimal formatting for the 4G remaining figure. */
+    private fun preciseBytes(b: Long): String {
+        val mb = b / 1048576.0
+        return if (mb >= 1024.0) "%.2fGB".format(mb / 1024.0) else "%.2fMB".format(mb)
+    }
+
+    private fun compactMbOrNa(b: Long): String = if (b < 0L) "n/a" else compactBytes(b)
+
+    private fun formatConsumed(b: Long): String {
+        val mb = b / 1048576.0
+        if (mb < 1024.0) return "%.0f MB".format(mb)
+        val gb = mb / 1024.0
+        return if (gb == gb.toLong().toDouble()) "${gb.toLong()} GB"
+        else "%.2f GB".format(gb).trimEnd('0').trimEnd('.')
+    }
+
+    private fun cap4gBytes(): Long =
+        getSharedPreferences("netscope", MODE_PRIVATE).getLong("cap4g_bytes", 0L)
+
+    private fun alertStepBytes(): Long =
+        getSharedPreferences("netscope", MODE_PRIVATE)
+            .getLong("alert_step_bytes", 500L * 1024 * 1024)
+
+    private fun saveCapUsed() {
+        getSharedPreferences("netscope", MODE_PRIVATE).edit()
+            .putLong("cap_used_4g_bytes", Live.capUsed4gBytes)
+            .apply()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun wifiRssi(): Int? = try {
+        val wm = getSystemService(WifiManager::class.java)
+        val rssi = wm.connectionInfo?.rssi
+        if (rssi == null || rssi == -127) null else rssi
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun cellQuality(): String? = when {
+        Live.signalDbm == Int.MIN_VALUE -> null
+        Live.signalLevel >= 4 -> "Excellent"
+        Live.signalLevel == 3 -> "Good"
+        Live.signalLevel == 2 -> "Fair"
+        Live.signalLevel == 1 -> "Weak"
+        else -> "No signal"
+    }
+
+    private fun wifiQuality(): String? = wifiRssi()?.let {
+        when {
+            it >= -55 -> "Excellent"
+            it >= -67 -> "Good"
+            it >= -78 -> "Fair"
+            it >= -90 -> "Weak"
+            else -> "Poor"
+        }
+    }
+
+    private fun signalLine(): String {
+        val cell = cellQuality()?.let { "Cell $it" } ?: "Cell n/a"
+        val wifi = wifiQuality()?.let { "Wi-Fi $it" } ?: "Wi-Fi n/a"
+        return "$cell  ·  $wifi"
+    }
+
+    private fun openAppIntent(): PendingIntent = PendingIntent.getActivity(
+        this,
+        0,
+        Intent(this, MainActivity::class.java)
+            .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+
+    private fun buildNotification(): Notification {
+        val net = currentNetworkLabel()
+        val speedLine = "$net  ·  Down ${formatSpeed(Live.downBps)}  Up ${formatSpeed(Live.upBps)}"
+        val cap = cap4gBytes()
+        val fourG = if (cap > 0L) {
+            val remaining = cap - Live.capUsed4gBytes
+            val tail = if (remaining >= 0L) preciseBytes(remaining)
+            else "over ${preciseBytes(-remaining)}"
+            "4G: ${compactBytes(Live.capUsed4gBytes)} ($tail)"
+        } else {
+            "4G: ${compactBytes(Live.capUsed4gBytes)}"
+        }
+        val totalsLine = "$fourG  ·  5G: ${compactBytes(Live.totals["5g"] ?: 0L)}  ·  " +
+            "Wi-Fi: ${compactMbOrNa(Live.nsWifiSession)}"
+        val signal = "Signal: ${signalLine()}"
+
+        val collapsed = RemoteViews(packageName, R.layout.notification_collapsed)
+        collapsed.setTextViewText(R.id.notif_line1, speedLine)
+        collapsed.setTextViewText(R.id.notif_line2, totalsLine)
+
+        val expanded = RemoteViews(packageName, R.layout.notification_expanded)
+        expanded.setTextViewText(R.id.notif_line1, speedLine)
+        expanded.setTextViewText(R.id.notif_line2, totalsLine)
+        expanded.setTextViewText(R.id.notif_signal, signal)
+
+        return Notification.Builder(this, "log")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("NetScope")
+            .setSubText(net)
+            .setContentText(speedLine)
+            .setStyle(Notification.DecoratedCustomViewStyle())
+            .setCustomContentView(collapsed)
+            .setCustomBigContentView(expanded)
+            .setContentIntent(openAppIntent())
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setShowWhen(false)
+            .build()
+    }
+
+    private fun updateNotification() {
+        if (!Live.running) return
+        getSystemService(NotificationManager::class.java).notify(1, buildNotification())
+    }
+
+    private fun notifyClassChange(from: String, to: String) {
+        val n = Notification.Builder(this, "alerts")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("Mobile network changed")
+            .setContentText("${from.uppercase()} → ${to.uppercase()}")
+            .setContentIntent(openAppIntent())
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(2, n)
+    }
+
+    private fun checkUsageMilestone() {
+        val step = alertStepBytes()
+        val used = Live.capUsed4gBytes
+        if (step != lastAlertStep) {
+            lastAlertStep = step
+            lastMilestone = if (step > 0L) used / step else 0L
+            return
+        }
+        if (step <= 0L) return
+        val milestone = used / step
+        if (milestone <= lastMilestone) return
+        lastMilestone = milestone
+
+        val consumed = milestone * step
+        val cap = cap4gBytes()
+        val text = if (cap > 0L) {
+            val remaining = cap - used
+            val tail = if (remaining >= 0L) "${preciseBytes(remaining)} left"
+            else "over ${preciseBytes(-remaining)}"
+            "${formatConsumed(consumed)} 4G consumed · $tail"
+        } else {
+            "${formatConsumed(consumed)} 4G consumed"
+        }
+        val n = Notification.Builder(this, "alerts")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("4G usage")
+            .setContentText(text)
+            .setContentIntent(openAppIntent())
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(3, n)
+    }
+
     private fun today(type: Int): Long = try {
         val s = LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
         val b = getSystemService(NetworkStatsManager::class.java)
@@ -155,11 +377,138 @@ class LoggerService : Service() {
         -1L
     }
 
+    private fun snapshot(): SessionSnapshot = SessionSnapshot(
+        totals = Live.totals.toMap(),
+        ambiguous = Live.ambiguous.toMap(),
+        ambiguousTotal = Live.ambiguousTotal,
+        rebaseTotal = Live.rebaseTotal,
+        resetEvents = Live.resetEvents,
+        nsMobileSession = Live.nsMobileSession,
+        nsWifiSession = Live.nsWifiSession,
+        maxIntervalMs = Live.maxIntervalMs,
+        lastMarker = Live.lastMarker,
+        lastMarkerAt = Live.lastMarkerAt,
+        markerCount = Live.markerCount,
+        nsPrevMobile = nsPrevMobile,
+        nsPrevWifi = nsPrevWifi,
+        lastMilestone = lastMilestone,
+        lastAlertStep = lastAlertStep,
+    )
+
+    /** Persist the session, allowance usage, and daily history together. */
+    private fun persist() {
+        HistoryStore.save(this, HistoryLive.days)
+        SessionStore.save(this, snapshot())
+        saveCapUsed()
+    }
+
+    /**
+     * Keep only the last 24 hours of the detailed CSV. Daily history is stored
+     * separately in history.json and is never pruned.
+     */
+    private fun pruneCsv() {
+        if (!file.exists()) return
+        val cutoff = Instant.now().minus(24, ChronoUnit.HOURS)
+        val lines = runCatching { file.readLines() }.getOrNull() ?: return
+        if (lines.size <= 1) return
+        val header = lines.first()
+        val kept = lines.drop(1).filter { line ->
+            val stamp = line.substringBefore(',').let {
+                runCatching { Instant.parse(it) }.getOrNull()
+            }
+            stamp == null || !stamp.isBefore(cutoff)
+        }
+        if (kept.size == lines.size - 1) return
+        val tmp = File(filesDir, "netscope_poc.csv.tmp")
+        runCatching {
+            tmp.writeText((listOf(header) + kept).joinToString("\n", postfix = "\n"))
+            if (!tmp.renameTo(file)) {
+                file.delete()
+                tmp.renameTo(file)
+            }
+        }
+    }
+
+    private fun resetSessionState() {
+        Live.totals.clear()
+        Live.ambiguous.clear()
+        Live.ambiguousTotal = 0
+        Live.rebaseTotal = 0
+        Live.resetEvents = 0
+        Live.nsMobileSession = -1
+        Live.nsWifiSession = -1
+        Live.signalDbm = Int.MIN_VALUE
+        Live.signalLevel = 0
+        Live.mobRx = 0
+        Live.mobTx = 0
+        Live.nsMobile = 0
+        Live.nsWifi = 0
+        Live.downBps = 0
+        Live.upBps = 0
+        Live.mobileDownBps = 0
+        Live.mobileUpBps = 0
+        Live.wifiDownBps = 0
+        Live.wifiUpBps = 0
+        Live.note = ""
+        Live.lastMarker = ""
+        Live.lastMarkerAt = 0
+        Live.lastSampleAt = 0
+        Live.lastIntervalMs = 0
+        Live.maxIntervalMs = 0
+        Live.stopAfterSample = false
+        Live.markerCount = 0
+        highWaterRx = 0
+        highWaterTx = 0
+        rebasePending = false
+        rebaseHighWaterRx = 0
+        rebaseHighWaterTx = 0
+        resetAtElapsed = 0
+        nsPrevMobile = -1
+        nsPrevWifi = -1
+        lastNsElapsed = 0
+        lastMilestone = 0
+        lastAlertStep = 0
+        last = null
+        lastElapsed = 0
+        lastTotalRx = -1L
+        lastTotalTx = -1L
+        sampleClass = NetworkClassifier.CLASS_UNKNOWN
+        lastStableClass = NetworkClassifier.CLASS_UNKNOWN
+        transitions.clear()
+        pendingRestartGap = false
+    }
+
+    private fun applySnapshot(snapshot: SessionSnapshot) {
+        Live.totals.clear()
+        Live.totals.putAll(snapshot.totals)
+        Live.ambiguous.clear()
+        Live.ambiguous.putAll(snapshot.ambiguous)
+        Live.ambiguousTotal = snapshot.ambiguousTotal
+        Live.rebaseTotal = snapshot.rebaseTotal
+        Live.resetEvents = snapshot.resetEvents
+        Live.nsMobileSession = snapshot.nsMobileSession
+        Live.nsWifiSession = snapshot.nsWifiSession
+        Live.maxIntervalMs = snapshot.maxIntervalMs
+        Live.lastMarker = snapshot.lastMarker
+        Live.lastMarkerAt = snapshot.lastMarkerAt
+        Live.markerCount = snapshot.markerCount
+        nsPrevMobile = snapshot.nsPrevMobile
+        nsPrevWifi = snapshot.nsPrevWifi
+        Live.nsMobile = snapshot.nsPrevMobile
+        Live.nsWifi = snapshot.nsPrevWifi
+        lastMilestone = snapshot.lastMilestone
+        lastAlertStep = snapshot.lastAlertStep
+        // The first NetworkStats query after a restart reports the traffic that
+        // happened while the service was down. Only add a positive gap.
+        pendingRestartGap = snapshot.nsPrevMobile >= 0L
+    }
+
     private val loop = object : Runnable {
         override fun run() {
             val next = sample()
             if (Live.stopAfterSample) {
                 Live.stopAfterSample = false
+                explicitStop = true
                 stopSelf()
                 return
             }
@@ -190,11 +539,15 @@ class LoggerService : Service() {
         var nsM = Live.nsMobile
         var nsW = Live.nsWifi
         var nsDelta: Long? = null
+        var wifiDelta: Long? = null
         var nsRefreshed = false
+        var mobileQueryOk = false
+        val todayDate = HistoryMath.dateOf(System.currentTimeMillis())
         if (needNs) {
             val qM = today(ConnectivityManager.TYPE_MOBILE)
             val qW = today(ConnectivityManager.TYPE_WIFI)
             nsRefreshed = qM >= 0 || qW >= 0
+            mobileQueryOk = qM >= 0
             if (qM >= 0) {
                 val prevM = nsPrevMobile
                 if (prevM < 0) {
@@ -212,12 +565,30 @@ class LoggerService : Service() {
                 if (prevW < 0) {
                     Live.nsWifiSession = 0
                 } else if (qW >= prevW) {
-                    Live.nsWifiSession = Live.nsWifiSession.coerceAtLeast(0L) + (qW - prevW)
+                    val d = qW - prevW
+                    Live.nsWifiSession = Live.nsWifiSession.coerceAtLeast(0L) + d
+                    wifiDelta = d
                 }
                 nsPrevWifi = qW
                 nsW = qW
             }
             lastNsElapsed = now
+        }
+
+        // Wi-Fi is not generation-classified, so its daily history comes from
+        // the authoritative NetworkStats delta.
+        wifiDelta?.let { HistoryLive.addWifi(todayDate, it) }
+
+        // Traffic that occurred while the service was down. Only a positive
+        // NetworkStats gap is added, and it goes to the unknown mobile bucket.
+        if (pendingRestartGap && mobileQueryOk) {
+            val gap = nsDelta ?: 0L
+            if (gap > 0L) {
+                Live.totals[NetworkClassifier.CLASS_UNKNOWN] =
+                    (Live.totals[NetworkClassifier.CLASS_UNKNOWN] ?: 0L) + gap
+                HistoryLive.addMobile(todayDate, NetworkClassifier.CLASS_UNKNOWN, gap)
+            }
+            pendingRestartGap = false
         }
 
         // A recovery is only a rebase signal while the counter is still below
@@ -247,10 +618,15 @@ class LoggerService : Service() {
                 Live.ambiguous[assignment.bucket] =
                     (Live.ambiguous[assignment.bucket] ?: 0L) + assignment.ambiguousBytes
             }
+            HistoryLive.addMobile(todayDate, assignment.bucket, assignment.bytes)
+            if (assignment.bucket == NetworkClassifier.CLASS_4G) {
+                Live.capUsed4gBytes += assignment.bytes
+            }
         }
         Live.ambiguousTotal += attribution.ambiguousBytes
         Live.rebaseTotal += attribution.rebaseBytes
         if (attribution.resetDetected) Live.resetEvents += 1
+        checkUsageMilestone()
 
         // Rebase bookkeeping, per direction. A reset in RX can be hidden by TX
         // growth, so each direction keeps its own high-water mark. The recovery
@@ -339,6 +715,16 @@ class LoggerService : Service() {
         lastElapsed = now
         sampleClass = own
 
+        if (now - lastPersistElapsed >= PERSIST_INTERVAL_MS) {
+            persist()
+            lastPersistElapsed = now
+        }
+        if (now - lastPruneElapsed >= PRUNE_INTERVAL_MS) {
+            pruneCsv()
+            lastPruneElapsed = now
+        }
+
+        updateNotification()
         return if (rawDelta > ACTIVE_SAMPLE_BYTES) FAST_INTERVAL_MS else SLOW_INTERVAL_MS
     }
 
@@ -360,11 +746,25 @@ class LoggerService : Service() {
             }
         }
         if (!file.exists()) file.writeText("$CSV_HEADER\n")
-        getSystemService(NotificationManager::class.java)
-            .createNotificationChannel(NotificationChannel("log", "Logging", NotificationManager.IMPORTANCE_LOW))
-        val n = Notification.Builder(this, "log").setContentTitle("NetScope POC logging")
-            .setContentText("Sampling every 2-5 s")
-            .setSmallIcon(android.R.drawable.stat_notify_sync).build()
+
+        HistoryStore.ensureLoaded(this)
+        pruneCsv()
+
+        resetSessionState()
+        Live.capUsed4gBytes = getSharedPreferences("netscope", MODE_PRIVATE)
+            .getLong("cap_used_4g_bytes", 0L)
+        SessionStore.load(this)?.let { applySnapshot(it) }
+
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(
+            NotificationChannel("log", "Logging", NotificationManager.IMPORTANCE_LOW),
+        )
+        nm.createNotificationChannel(
+            NotificationChannel("alerts", "Network alerts", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "4G/5G changes and 4G usage milestones"
+            },
+        )
+        val n = buildNotification()
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
@@ -379,50 +779,29 @@ class LoggerService : Service() {
             // Without READ_PHONE_STATE every interval is honestly classified as unknown.
         }
         Live.running = true
-        Live.totals.clear()
-        Live.ambiguous.clear()
-        Live.ambiguousTotal = 0
-        Live.rebaseTotal = 0
-        Live.resetEvents = 0
-        Live.nsMobileSession = -1
-        Live.nsWifiSession = -1
-        Live.mobRx = 0
-        Live.mobTx = 0
-        Live.nsMobile = 0
-        Live.nsWifi = 0
-        Live.downBps = 0
-        Live.upBps = 0
-        Live.mobileDownBps = 0
-        Live.mobileUpBps = 0
-        Live.wifiDownBps = 0
-        Live.wifiUpBps = 0
-        Live.note = ""
-        Live.lastMarker = ""
-        Live.lastMarkerAt = 0
-        Live.lastSampleAt = 0
-        Live.lastIntervalMs = 0
-        Live.maxIntervalMs = 0
-        Live.stopAfterSample = false
-        highWaterRx = 0
-        highWaterTx = 0
-        rebasePending = false
-        rebaseHighWaterRx = 0
-        rebaseHighWaterTx = 0
-        resetAtElapsed = 0
-        nsPrevMobile = -1
-        nsPrevWifi = -1
-        lastNsElapsed = 0
-        last = null
-        lastElapsed = 0
-        lastTotalRx = -1L
-        lastTotalTx = -1L
-        sampleClass = NetworkClassifier.CLASS_UNKNOWN
-        lastStableClass = NetworkClassifier.CLASS_UNKNOWN
-        transitions.clear()
+        lastPruneElapsed = SystemClock.elapsedRealtime()
         h.post(loop)
     }
 
-    override fun onStartCommand(i: Intent?, f: Int, id: Int) = START_STICKY
+    private fun stopExplicitly() {
+        explicitStop = true
+        HistoryStore.save(this, HistoryLive.days)
+        stopSelf()
+    }
+
+    override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+        if (i?.action == ACTION_STOP) {
+            explicitStop = true
+            if (Live.note.isNotEmpty()) {
+                // One more sample consumes the pending marker before stopping.
+                Live.stopAfterSample = true
+            } else {
+                stopExplicitly()
+            }
+        }
+        return START_STICKY
+    }
+
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onDestroy() {
@@ -433,19 +812,31 @@ class LoggerService : Service() {
             } catch (_: Exception) {
             }
         }
+        if (explicitStop) {
+            // An explicit user Stop ends the session; daily history and the
+            // allowance usage are kept until the user resets usage.
+            HistoryStore.save(this, HistoryLive.days)
+            SessionStore.clear(this)
+            saveCapUsed()
+        } else {
+            persist()
+        }
         Live.running = false
         Live.stopAfterSample = false
     }
 
-    private companion object {
-        const val FAST_INTERVAL_MS = 2_000L
+    companion object {
+        const val ACTION_STOP = "com.example.netscopepoc.action.STOP"
+        const val FAST_INTERVAL_MS = 1_000L
         const val SLOW_INTERVAL_MS = 5_000L
         const val ACTIVE_SAMPLE_BYTES = 200_000L
+        const val PERSIST_INTERVAL_MS = 5_000L
+        const val PRUNE_INTERVAL_MS = 60L * 60L * 1000L
 
         /**
-         * 2 s is a compromise: fresh enough for the per-interval NetworkStats
-         * sanity bound, cheaper than querying on every sample. TrafficStats
-         * and telephony also sample at 2 s while mobile bytes are moving.
+         * NetworkStats is queried no more often than every 2 s. TrafficStats and
+         * telephony sample at 1 s while mobile bytes are moving so the displayed
+         * speed stays fresh.
          */
         const val NS_REFRESH_MS = 2_000L
         const val NS_FORCE_QUERY_BYTES = 256L * 1024 * 1024

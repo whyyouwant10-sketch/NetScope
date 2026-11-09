@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#101418</color>
+    <color name="notif_text">#DE000000</color>
+    <color name="notif_text_secondary">#8A000000</color>
 </resources>
